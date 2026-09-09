@@ -1,12 +1,19 @@
 """
 Compile packaged lookup data for zip2info.
 
-Timezone mappings are preserved from the existing generated module.
-Coordinates are merged from multiple sources (in priority order):
-  1. GeoNames US postal codes (CC BY 4.0)
-  2. U.S. Census ZCTA gazetteer centroids (public domain)
+Timezones are *derived* from each ZIP centroid via ``timezonefinder`` rather
+than copied from the previous build. That matters: the old script re-read its
+own output as the timezone source, so the shipped ZIP set could never gain a
+code and silently shrank whenever a coordinate went missing. Deriving from the
+source geography makes the table a function of the upstream feeds instead.
+
+Coordinate sources, in increasing priority:
+  1. U.S. Census ZCTA gazetteer centroids (public domain)
+  2. GeoNames postal data for the US and its territories (CC BY 4.0)
   3. Manual overrides in data/coordinate_overrides.json
-  4. 3-digit ZIP prefix centroid fallback from higher-confidence matches
+
+The previously generated module is consulted only for ZIPs the upstream feeds
+have since retired, so established codes are never dropped.
 
 Usage:
     python scripts/compile_data.py
@@ -15,159 +22,160 @@ Usage:
 from __future__ import annotations
 
 import ast
+import collections
 import io
 import json
 import sys
 import urllib.request
 import zipfile
-from collections import defaultdict
 from pathlib import Path
-from statistics import mean
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from timezonefinder import TimezoneFinder
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src" / "zip2info"
-LEGACY_DATA = ROOT / "src" / "zip2tz" / "_data.py"
 OUTPUT = SRC_DIR / "_data.py"
 OVERRIDES_PATH = ROOT / "data" / "coordinate_overrides.json"
 
-GEONAMES_US_ZIP_URL = "https://download.geonames.org/export/zip/US.zip"
+# The US file omits the territories; GeoNames ships each separately.
+GEONAMES_COUNTRIES = ("US", "PR", "VI", "GU", "AS", "MP")
+GEONAMES_ZIP_URL = "https://download.geonames.org/export/zip/{country}.zip"
 CENSUS_ZCTA_GAZETTEER_URL = (
     "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/Gaz_zcta_national.zip"
 )
 
+Coordinate = tuple[float, float]
 
-def _load_legacy_timezone_data() -> tuple[tuple[str, ...], dict[int, int]]:
-    source = LEGACY_DATA if LEGACY_DATA.exists() else OUTPUT
-    if not source.exists():
-        raise FileNotFoundError(
-            f"No timezone source found at {LEGACY_DATA} or {OUTPUT}"
-        )
+# Only these zones may ship. A ZIP centroid can legitimately land on foreign
+# soil -- APO/FPO/DPO codes carry the coordinates of the overseas base, and a
+# handful of border ZIPs have centroids just across the line -- which yields
+# zones like Europe/Berlin, America/Toronto or America/Sao_Paulo. The
+# "America/" prefix is a continent, not a country, so it cannot be used as the
+# filter. ZIPs resolving outside this set are omitted, leaving callers to apply
+# their own fallback rather than acting on a foreign local time.
+US_TIMEZONES = frozenset(
+    {
+        "America/Adak",
+        "America/Anchorage",
+        "America/Boise",
+        "America/Chicago",
+        "America/Denver",
+        "America/Detroit",
+        "America/Indiana/Indianapolis",
+        "America/Indiana/Knox",
+        "America/Indiana/Marengo",
+        "America/Indiana/Petersburg",
+        "America/Indiana/Tell_City",
+        "America/Indiana/Vevay",
+        "America/Indiana/Vincennes",
+        "America/Indiana/Winamac",
+        "America/Juneau",
+        "America/Kentucky/Louisville",
+        "America/Kentucky/Monticello",
+        "America/Los_Angeles",
+        "America/Menominee",
+        "America/Metlakatla",
+        "America/New_York",
+        "America/Nome",
+        "America/North_Dakota/Beulah",
+        "America/North_Dakota/Center",
+        "America/North_Dakota/New_Salem",
+        "America/Phoenix",
+        "America/Puerto_Rico",
+        "America/Sitka",
+        "America/St_Thomas",
+        "America/Yakutat",
+        "Pacific/Guam",
+        "Pacific/Honolulu",
+        "Pacific/Midway",
+        "Pacific/Pago_Pago",
+        "Pacific/Saipan",
+        "Pacific/Wake",
+    }
+)
 
-    module = ast.parse(source.read_text(encoding="utf-8"))
-    timezones: tuple[str, ...] | None = None
-    zip_tz: dict[int, int] | None = None
-    zip_info: dict[int, tuple[int, float, float]] | None = None
-
-    def _set_from_target(name: str, value_node: ast.expr) -> None:
-        nonlocal timezones, zip_tz, zip_info
-        if name == "TIMEZONES":
-            timezones = ast.literal_eval(value_node)
-        elif name == "ZIP_TZ":
-            zip_tz = ast.literal_eval(value_node)
-        elif name == "ZIP_INFO":
-            zip_info = ast.literal_eval(value_node)
-
-    for node in module.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    _set_from_target(target.id, node.value)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.value is not None:
-                _set_from_target(node.target.id, node.value)
-
-    if zip_tz is None and zip_info is not None:
-        zip_tz = {zip_code: value[0] for zip_code, value in zip_info.items()}
-
-    if timezones is None or zip_tz is None:
-        raise ValueError(f"Could not parse TIMEZONES and ZIP_TZ/ZIP_INFO from {source}")
-
-    return timezones, zip_tz
-
-
-def _load_existing_coordinate_data() -> dict[str, tuple[float, float]]:
-    if not OUTPUT.exists():
-        return {}
-
-    module = ast.parse(OUTPUT.read_text(encoding="utf-8"))
-    zip_info: dict[int, tuple[int, float, float]] | None = None
-    coordinates: tuple[tuple[float, float], ...] | None = None
-    zip_coord: dict[int, int] | None = None
-
-    def _set_from_target(name: str, value_node: ast.expr) -> None:
-        nonlocal zip_info, coordinates, zip_coord
-        if name == "ZIP_INFO":
-            zip_info = ast.literal_eval(value_node)
-        elif name == "COORDINATES":
-            coordinates = ast.literal_eval(value_node)
-        elif name == "ZIP_COORD":
-            zip_coord = ast.literal_eval(value_node)
-
-    for node in module.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    _set_from_target(target.id, node.value)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            if node.value is not None:
-                _set_from_target(node.target.id, node.value)
-
-    if zip_info is not None:
-        return {
-            _zip_to_geoid(zip_code): (latitude, longitude)
-            for zip_code, (_, latitude, longitude) in zip_info.items()
-        }
-
-    if coordinates is not None and zip_coord is not None:
-        return {
-            _zip_to_geoid(zip_code): coordinates[coord_idx]
-            for zip_code, coord_idx in zip_coord.items()
-        }
-
-    return {}
+# Spot checks that must survive any regeneration. These pin the timezone
+# boundaries that are easy to get wrong -- Arizona's no-DST carve-out, the
+# Indiana and Kentucky county splits, and the Alaska zones.
+EXPECTED_TIMEZONES = {
+    "00501": "America/New_York",
+    "00926": "America/Puerto_Rico",
+    "01001": "America/New_York",
+    "10001": "America/New_York",
+    "46201": "America/Indiana/Indianapolis",
+    "46401": "America/Chicago",
+    "47591": "America/Indiana/Vincennes",
+    "58102": "America/Chicago",
+    "60601": "America/Chicago",
+    "78074": "America/Chicago",
+    "85001": "America/Phoenix",
+    "85701": "America/Phoenix",
+    "86515": "America/Denver",
+    "90210": "America/Los_Angeles",
+    "96801": "Pacific/Honolulu",
+    "99501": "America/Anchorage",
+    "99546": "America/Adak",
+}
 
 
-def _download_postal_coordinates() -> dict[str, tuple[float, float]]:
-    print(f"Downloading GeoNames US postal data from {GEONAMES_US_ZIP_URL}...")
-    with urllib.request.urlopen(GEONAMES_US_ZIP_URL, timeout=120) as response:
-        payload = response.read()
+def _zip_to_geoid(zip_code: int | str) -> str:
+    return str(zip_code).zfill(5)
 
-    coordinates: dict[str, tuple[float, float]] = {}
+
+def _fetch(url: str) -> bytes:
+    print(f"Downloading {url}...")
+    with urllib.request.urlopen(url, timeout=180) as response:
+        return response.read()
+
+
+def _read_single_text_member(payload: bytes, *, skip_readme: bool) -> str:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        names = [name for name in archive.namelist() if name.endswith(".txt")]
+        if skip_readme:
+            names = [n for n in names if not n.lower().startswith("readme")]
+        if not names:
+            raise ValueError("archive did not contain a data .txt file")
+        return archive.read(names[0]).decode("utf-8")
+
+
+def _download_geonames_coordinates() -> dict[str, Coordinate]:
+    """ZIP centroids for the US and its territories, best accuracy per code."""
+    coordinates: dict[str, Coordinate] = {}
     accuracy_rank: dict[str, int] = {}
 
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-        data_names = [
-            name
-            for name in archive.namelist()
-            if name.endswith(".txt") and not name.lower().startswith("readme")
-        ]
-        if not data_names:
-            raise ValueError("GeoNames archive did not contain a data .txt file")
-        raw = archive.read(data_names[0]).decode("utf-8")
-
-    for line in raw.splitlines():
-        if not line.strip() or line.startswith("#"):
-            continue
-        parts = line.split("\t")
-        if len(parts) < 11:
-            continue
-        postal_code = parts[1].strip()
-        if len(postal_code) != 5 or not postal_code.isdigit():
-            continue
-        lat = float(parts[9])
-        lon = float(parts[10])
-        accuracy = int(parts[11]) if parts[11].isdigit() else 1
-        existing_rank = accuracy_rank.get(postal_code)
-        if existing_rank is None or accuracy >= existing_rank:
-            coordinates[postal_code] = (lat, lon)
+    for country in GEONAMES_COUNTRIES:
+        raw = _read_single_text_member(
+            _fetch(GEONAMES_ZIP_URL.format(country=country)), skip_readme=True
+        )
+        found = 0
+        for line in raw.splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 12:
+                continue
+            postal_code = parts[1].strip()
+            if len(postal_code) != 5 or not postal_code.isdigit():
+                continue
+            accuracy = int(parts[11]) if parts[11].strip().isdigit() else 1
+            if accuracy < accuracy_rank.get(postal_code, -1):
+                continue
+            coordinates[postal_code] = (float(parts[9]), float(parts[10]))
             accuracy_rank[postal_code] = accuracy
+            found += 1
+        print(f"  {country}: {found} postal records")
 
-    print(f"Loaded {len(coordinates)} GeoNames postal coordinate records")
+    print(f"Loaded {len(coordinates)} GeoNames coordinate records")
     return coordinates
 
 
-def _download_census_zcta_coordinates() -> dict[str, tuple[float, float]]:
-    print(f"Downloading Census ZCTA gazetteer from {CENSUS_ZCTA_GAZETTEER_URL}...")
-    with urllib.request.urlopen(CENSUS_ZCTA_GAZETTEER_URL, timeout=120) as response:
-        payload = response.read()
+def _download_census_zcta_coordinates() -> dict[str, Coordinate]:
+    raw = _read_single_text_member(
+        _fetch(CENSUS_ZCTA_GAZETTEER_URL), skip_readme=False
+    )
 
-    coordinates: dict[str, tuple[float, float]] = {}
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-        data_names = [name for name in archive.namelist() if name.endswith(".txt")]
-        if not data_names:
-            raise ValueError("Census archive did not contain a .txt file")
-        raw = archive.read(data_names[0]).decode("utf-8")
-
+    coordinates: dict[str, Coordinate] = {}
     for line in raw.splitlines():
         if not line.strip():
             continue
@@ -177,120 +185,194 @@ def _download_census_zcta_coordinates() -> dict[str, tuple[float, float]]:
         geoid = parts[0].strip()
         if len(geoid) != 5 or not geoid.isdigit():
             continue
-        # Gazetteer layout: GEOID, POP10, HU10, ALAND, AWATER, ALAND_SQMI, AWATER_SQMI,
-        # INTPTLAT, INTPTLONG
+        # Gazetteer layout: GEOID, POP10, HU10, ALAND, AWATER, ALAND_SQMI,
+        # AWATER_SQMI, INTPTLAT, INTPTLONG
         coordinates[geoid] = (float(parts[7]), float(parts[8]))
 
     print(f"Loaded {len(coordinates)} Census ZCTA coordinate records")
     return coordinates
 
 
-def _load_manual_overrides() -> dict[str, tuple[float, float]]:
+def _load_manual_overrides() -> dict[str, Coordinate]:
     if not OVERRIDES_PATH.exists():
         return {}
     raw = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
-    overrides: dict[str, tuple[float, float]] = {}
-    for geoid, value in raw.items():
-        lat, lon = value
-        overrides[str(geoid).zfill(5)] = (float(lat), float(lon))
+    overrides = {
+        _zip_to_geoid(geoid): (float(lat), float(lon))
+        for geoid, (lat, lon) in raw.items()
+    }
     print(f"Loaded {len(overrides)} manual coordinate overrides")
     return overrides
 
 
-def _zip_to_geoid(zip_int: int) -> str:
-    return str(zip_int).zfill(5)
+def _load_previous_dataset() -> dict[str, tuple[str, float, float]]:
+    """Previous build keyed by ZIP -> (timezone *name*, lat, lon).
+
+    Resolved by name, never by index: a stale index is exactly how ZIP 00926
+    shipped pointing past the end of TIMEZONES.
+    """
+    if not OUTPUT.exists():
+        return {}
+
+    module = ast.parse(OUTPUT.read_text(encoding="utf-8"))
+    timezones: tuple[str, ...] | None = None
+    zip_info: dict[int, tuple[int, float, float]] | None = None
+
+    for node in module.body:
+        targets = (
+            [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if isinstance(node, ast.Assign)
+            else [node.target.id]
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            else []
+        )
+        value = node.value
+        if value is None:
+            continue
+        for name in targets:
+            if name == "TIMEZONES":
+                timezones = ast.literal_eval(value)
+            elif name == "ZIP_INFO":
+                zip_info = ast.literal_eval(value)
+
+    if not timezones or not zip_info:
+        return {}
+
+    previous: dict[str, tuple[str, float, float]] = {}
+    skipped = 0
+    for zip_code, (tz_idx, latitude, longitude) in zip_info.items():
+        if not 0 <= tz_idx < len(timezones):
+            skipped += 1
+            continue
+        previous[_zip_to_geoid(zip_code)] = (timezones[tz_idx], latitude, longitude)
+
+    if skipped:
+        print(f"Ignored {skipped} previous records with out-of-range timezone indices")
+    print(f"Loaded {len(previous)} records from the previous dataset")
+    return previous
 
 
-def _merge_postal_coordinates(
-    *sources: dict[str, tuple[float, float]],
-) -> dict[str, tuple[float, float]]:
-    """Later sources override earlier ones (GeoNames should win over Census)."""
-    merged: dict[str, tuple[float, float]] = {}
+def _merge_coordinates(*sources: dict[str, Coordinate]) -> dict[str, Coordinate]:
+    """Later sources win."""
+    merged: dict[str, Coordinate] = {}
     for source in sources:
         merged.update(source)
     return merged
 
 
-def _apply_prefix_fallback(
-    zip_tz: dict[int, int],
-    postal_coords: dict[str, tuple[float, float]],
-) -> dict[str, tuple[float, float]]:
-    prefix_coords: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    for zip_int in zip_tz:
-        geoid = _zip_to_geoid(zip_int)
-        coord = postal_coords.get(geoid)
-        if coord is not None:
-            prefix_coords[geoid[:3]].append(coord)
-
-    filled = 0
-    for zip_int in zip_tz:
-        geoid = _zip_to_geoid(zip_int)
-        if geoid in postal_coords:
-            continue
-        candidates = prefix_coords.get(geoid[:3])
-        if not candidates:
-            continue
-        postal_coords[geoid] = (mean(lat for lat, _ in candidates), mean(lon for _, lon in candidates))
-        filled += 1
-
-    if filled:
-        print(f"Filled {filled} ZIP codes via 3-digit prefix centroid fallback")
-    return postal_coords
-
-
 def _build_zip_info(
-    zip_tz: dict[int, int],
-    postal_coords: dict[str, tuple[float, float]],
-) -> dict[int, tuple[int, float, float]]:
-    zip_info: dict[int, tuple[int, float, float]] = {}
-    for zip_int in sorted(zip_tz):
-        geoid = _zip_to_geoid(zip_int)
-        coord = postal_coords.get(geoid)
-        if coord is None:
-            continue
-        latitude, longitude = coord
-        zip_info[zip_int] = (zip_tz[zip_int], latitude, longitude)
+    coordinates: dict[str, Coordinate],
+    previous: dict[str, tuple[str, float, float]],
+) -> tuple[tuple[str, ...], dict[int, tuple[int, float, float]]]:
+    finder = TimezoneFinder()
 
-    return zip_info
+    resolved: dict[str, tuple[str, float, float]] = {}
+    unresolved = 0
+    foreign: collections.Counter[str] = collections.Counter()
+    for geoid, (latitude, longitude) in coordinates.items():
+        timezone_name = finder.timezone_at(lat=latitude, lng=longitude)
+        if timezone_name is None:
+            unresolved += 1
+            continue
+        if timezone_name not in US_TIMEZONES:
+            foreign[timezone_name] += 1
+            continue
+        resolved[geoid] = (timezone_name, latitude, longitude)
+
+    if unresolved:
+        print(f"Skipped {unresolved} ZIP codes whose centroid has no timezone")
+    if foreign:
+        top = ", ".join(f"{name} ({count})" for name, count in foreign.most_common(5))
+        print(
+            f"Skipped {sum(foreign.values())} ZIP codes resolving outside the US "
+            f"across {len(foreign)} zones: {top}, ..."
+        )
+
+    # Retired codes: keep whatever the last build knew rather than losing them.
+    carried = 0
+    for geoid, record in previous.items():
+        if geoid not in resolved and record[0] in US_TIMEZONES:
+            resolved[geoid] = record
+            carried += 1
+    if carried:
+        print(f"Carried {carried} retired ZIP codes forward from the previous dataset")
+
+    timezones = tuple(sorted({name for name, _, _ in resolved.values()}))
+    index_of = {name: index for index, name in enumerate(timezones)}
+    zip_info = {
+        int(geoid): (index_of[name], latitude, longitude)
+        for geoid, (name, latitude, longitude) in sorted(resolved.items())
+    }
+    return timezones, zip_info
+
+
+def _validate(
+    timezones: tuple[str, ...],
+    zip_info: dict[int, tuple[int, float, float]],
+    previous: dict[str, tuple[str, float, float]],
+) -> None:
+    """Fail the build rather than shipping a broken table."""
+    errors: list[str] = []
+
+    for zip_code, (tz_idx, _, _) in zip_info.items():
+        if not 0 <= tz_idx < len(timezones):
+            errors.append(
+                f"ZIP {_zip_to_geoid(zip_code)} has timezone index {tz_idx}, "
+                f"but TIMEZONES has {len(timezones)} entries"
+            )
+
+    for name in timezones:
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            errors.append(f"{name!r} is not a valid IANA timezone")
+
+    if len(zip_info) < len(previous):
+        errors.append(
+            f"ZIP coverage regressed: {len(zip_info)} < {len(previous)} previously"
+        )
+
+    for geoid, expected in EXPECTED_TIMEZONES.items():
+        record = zip_info.get(int(geoid))
+        if record is None:
+            errors.append(f"ZIP {geoid} is missing; expected {expected}")
+        elif (actual := timezones[record[0]]) != expected:
+            errors.append(f"ZIP {geoid} resolved to {actual}, expected {expected}")
+
+    if errors:
+        raise SystemExit(
+            "Refusing to write data module:\n"
+            + "\n".join(f"  - {error}" for error in errors)
+        )
 
 
 def _format_tuple_lines(values: tuple[str, ...], indent: str = "    ") -> str:
-    lines = [f"{indent}{value!r}," for value in values]
-    return "\n".join(lines)
-
-
-def _format_dict_entries(mapping: dict[int, int], indent: str = "    ") -> str:
-    lines = [f"{indent}{key}: {value}," for key, value in sorted(mapping.items())]
-    return "\n".join(lines)
+    return "\n".join(f"{indent}{value!r}," for value in values)
 
 
 def _format_zip_info_entries(
     zip_info: dict[int, tuple[int, float, float]],
     indent: str = "    ",
 ) -> str:
-    lines = [
+    return "\n".join(
         f"{indent}{zip_code}: ({tz_idx}, {latitude}, {longitude}),"
         for zip_code, (tz_idx, latitude, longitude) in sorted(zip_info.items())
-    ]
-    return "\n".join(lines)
+    )
 
 
 def _write_data_module(
     timezones: tuple[str, ...],
     zip_info: dict[int, tuple[int, float, float]],
-    total_zip_count: int,
 ) -> None:
     SRC_DIR.mkdir(parents=True, exist_ok=True)
-    matched = len(zip_info)
-    total = total_zip_count
     content = f'''"""
 Auto-generated lookup data for zip2info.
 Do not edit manually - regenerate with: python scripts/compile_data.py
 
-Timezone data is preserved from the prior zip2tz dataset.
+Timezones are derived from ZIP centroids with timezonefinder.
 Coordinates merge GeoNames (CC BY 4.0), Census ZCTA centroids (public domain),
-manual overrides, and 3-digit ZIP prefix fallback where needed.
-Coordinate coverage: {matched}/{total} ZIP codes with timezone mappings.
+and manual overrides.
+Coverage: {len(zip_info)} ZIP codes across {len(timezones)} timezones.
 """
 
 # Timezone strings indexed by ID
@@ -308,25 +390,23 @@ ZIP_INFO: dict[int, tuple[int, float, float]] = {{
 
 
 def main() -> int:
-    timezones, zip_tz = _load_legacy_timezone_data()
-    try:
-        postal_coords = _merge_postal_coordinates(
-            _download_census_zcta_coordinates(),
-            _download_postal_coordinates(),
-            _load_manual_overrides(),
-        )
-    except Exception as exc:
-        postal_coords = _load_existing_coordinate_data()
-        if not postal_coords:
-            raise
-        print(f"Warning: failed to download fresh coordinate sources, using existing generated coordinates: {exc}")
+    previous = _load_previous_dataset()
 
-    postal_coords = _apply_prefix_fallback(zip_tz, postal_coords)
-    zip_info = _build_zip_info(zip_tz, postal_coords)
-    missing = len(zip_tz) - len(zip_info)
-    if missing:
-        print(f"Warning: {missing} ZIP codes still lack coordinates")
-    _write_data_module(timezones, zip_info, len(zip_tz))
+    coordinates = _merge_coordinates(
+        _download_census_zcta_coordinates(),
+        _download_geonames_coordinates(),
+        _load_manual_overrides(),
+    )
+
+    timezones, zip_info = _build_zip_info(coordinates, previous)
+    _validate(timezones, zip_info, previous)
+
+    added = len(set(zip_info) - {int(geoid) for geoid in previous})
+    print(
+        f"Compiled {len(zip_info)} ZIP codes ({added:+d} vs previous) "
+        f"across {len(timezones)} timezones"
+    )
+    _write_data_module(timezones, zip_info)
     return 0
 
 

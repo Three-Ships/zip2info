@@ -47,7 +47,10 @@ class TestInfo:
     def test_generated_zip_info_has_full_coverage(self) -> None:
         from zip2info._data import ZIP_INFO
 
-        assert len(ZIP_INFO) == 38663
+        # A floor, not an exact count: coverage should be free to grow as the
+        # upstream feeds do, but never silently shrink the way it used to when
+        # the generator re-read its own output.
+        assert len(ZIP_INFO) >= 41_000
         assert 90210 in ZIP_INFO
 
     def test_generated_zip_info_entry_shape(self) -> None:
