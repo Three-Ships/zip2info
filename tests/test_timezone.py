@@ -1,9 +1,55 @@
 """Tests for zip2info timezone lookup."""
 
+from zoneinfo import ZoneInfo
+
 import pytest
 
 import zip2info
-from zip2info._data import TIMEZONES
+from zip2info._data import TIMEZONES, ZIP_INFO
+
+# Stated here rather than imported from scripts/compile_data.py: importing the
+# generator's own allowlist would make the assertion vacuous. This is the
+# contract the package promises -- US zones only.
+US_TIMEZONES = frozenset(
+    {
+        "America/Adak",
+        "America/Anchorage",
+        "America/Boise",
+        "America/Chicago",
+        "America/Denver",
+        "America/Detroit",
+        "America/Indiana/Indianapolis",
+        "America/Indiana/Knox",
+        "America/Indiana/Marengo",
+        "America/Indiana/Petersburg",
+        "America/Indiana/Tell_City",
+        "America/Indiana/Vevay",
+        "America/Indiana/Vincennes",
+        "America/Indiana/Winamac",
+        "America/Juneau",
+        "America/Kentucky/Louisville",
+        "America/Kentucky/Monticello",
+        "America/Los_Angeles",
+        "America/Menominee",
+        "America/Metlakatla",
+        "America/New_York",
+        "America/Nome",
+        "America/North_Dakota/Beulah",
+        "America/North_Dakota/Center",
+        "America/North_Dakota/New_Salem",
+        "America/Phoenix",
+        "America/Puerto_Rico",
+        "America/Sitka",
+        "America/St_Thomas",
+        "America/Yakutat",
+        "Pacific/Guam",
+        "Pacific/Honolulu",
+        "Pacific/Midway",
+        "Pacific/Pago_Pago",
+        "Pacific/Saipan",
+        "Pacific/Wake",
+    }
+)
 
 
 class TestStringInput:
@@ -164,3 +210,49 @@ class TestAllTimezones:
         for tz in TIMEZONES:
             assert "/" in tz, f"Invalid timezone format: {tz}"
             assert tz.startswith(("America/", "Pacific/")), f"Unexpected timezone: {tz}"
+
+    def test_only_us_timezones_are_shipped(self) -> None:
+        """A centroid can land abroad; those ZIPs must not ship.
+
+        ``America/`` is a continent, so the prefix check above would happily
+        admit America/Toronto or America/Sao_Paulo.
+        """
+        assert set(TIMEZONES) <= US_TIMEZONES
+
+    def test_every_timezone_index_is_in_range(self) -> None:
+        """ZIP 00926 once carried index 37 against a 30-entry table."""
+        for zipcode, (tz_idx, _, _) in ZIP_INFO.items():
+            assert 0 <= tz_idx < len(TIMEZONES), f"{zipcode} has index {tz_idx}"
+
+    def test_every_timezone_is_loadable(self) -> None:
+        for tz in TIMEZONES:
+            assert ZoneInfo(tz) is not None
+
+
+class TestRegressions:
+    """ZIPs that the pre-1.1.0 dataset got wrong."""
+
+    def test_zips_absent_from_the_frozen_dataset(self) -> None:
+        """The generator used to re-read its own output, so it never grew."""
+        assert zip2info.timezone("78074") == "America/Chicago"
+
+    def test_puerto_rico_no_longer_raises(self) -> None:
+        """00926 used to raise IndexError; PR ships in its own GeoNames file."""
+        assert zip2info.timezone("00926") == "America/Puerto_Rico"
+        assert zip2info.timezone("00601") == "America/Puerto_Rico"
+
+    @pytest.mark.parametrize(
+        ("zipcode", "expected"),
+        [
+            ("00802", "America/St_Thomas"),
+            ("96910", "Pacific/Guam"),
+            ("96950", "Pacific/Saipan"),
+            ("96799", "Pacific/Pago_Pago"),
+        ],
+    )
+    def test_territories(self, zipcode: str, expected: str) -> None:
+        assert zip2info.timezone(zipcode) == expected
+
+    def test_overseas_military_zips_are_omitted(self) -> None:
+        """APO/FPO centroids sit on the overseas base, not on US soil."""
+        assert zip2info.timezone("09001") is None

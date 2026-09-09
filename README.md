@@ -2,7 +2,7 @@
 
 Fast, zero-dependency US ZIP code lookups for Python.
 
-- **38,000+ zip codes** mapped to IANA timezones
+- **41,000+ zip codes** mapped to IANA timezones, including Puerto Rico and the territories
 - **Geocoordinates** for ZIP centroids (latitude/longitude)
 - **Zero dependencies** — pure Python, works everywhere
 - **O(1) lookup** — instant hash table lookups, no database or file I/O
@@ -65,12 +65,19 @@ Returns `None` when timezone or coordinate data is unavailable.
 
 ## Data sources
 
-- **Timezones**: bundled US ZIP-to-timezone dataset (same coverage as the original `zip2tz` project)
 - **Coordinates** (merged in priority order):
-  1. [GeoNames](https://www.geonames.org/) US postal codes ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/))
-  2. U.S. Census ZCTA gazetteer centroids (public domain)
+  1. U.S. Census ZCTA gazetteer centroids (public domain)
+  2. [GeoNames](https://www.geonames.org/) postal codes for the US and its territories ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/))
   3. Manual overrides in `data/coordinate_overrides.json`
-  4. 3-digit ZIP prefix centroid fallback for remaining USPS-only ZIPs (PO boxes, unique entity codes, etc.)
+- **Timezones**: derived from each ZIP centroid at build time with
+  [timezonefinder](https://github.com/jannikmi/timezonefinder). Deriving rather than
+  copying is what lets coverage track the upstream feeds; the shipped package stays
+  dependency-free.
+
+Only US timezones are shipped. A ZIP centroid can land on foreign soil — APO/FPO/DPO
+codes carry the coordinates of the overseas base — and those ZIPs are omitted rather
+than reported with a foreign local time. Note that `America/` is a continent, not a
+country, so it is not a usable filter on its own.
 
 Regenerate packaged data with:
 

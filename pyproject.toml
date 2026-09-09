@@ -1,6 +1,6 @@
 [project]
 name = "zip2info"
-version = "1.0.1"
+version = "1.1.0"
 description = "Fast US ZIP code lookups for timezone and geocoordinates"
 readme = "README.md"
 authors = [
@@ -22,4 +22,7 @@ exclude = [
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    # Build-time only: scripts/compile_data.py derives timezones from ZIP
+    # centroids. The published package stays dependency-free.
+    "timezonefinder>=6.5.0",
 ]
